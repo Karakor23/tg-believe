@@ -1,0 +1,16 @@
+{
+  "name": "tg-believe",
+  "version": "1.0.0",
+  "description": "",
+  "main": "poll_tg.js",
+  "scripts": {
+    "start": "node poll_tg.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "axios": "^1.9.0",
+    "dotenv": "^16.0.0"
+  }
+}
