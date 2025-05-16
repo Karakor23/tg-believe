@@ -1,54 +1,49 @@
 #!/usr/bin/env node
-require('dotenv').config();   // ← load .env into process.env
+require('dotenv').config();
 
 const fs    = require('fs');
 const path  = require('path');
 const axios = require('axios');
 
-// ── CONFIGURATION ───────────────────────────────────────────────────────────
+// ── CONFIG ─────────────────────────────────────────────────────────────────
 
 if (!process.env.TELEGRAM_TOKEN || !process.env.CHAT_ID) {
-  console.error("⚠️ Please set TELEGRAM_TOKEN and CHAT_ID");
+  console.error("⚠️  Please set TELEGRAM_TOKEN and CHAT_ID");
   process.exit(1);
 }
-const BOT_TOKEN     = process.env.TELEGRAM_TOKEN;
-const CHAT_ID       = process.env.CHAT_ID;
-const THREAD_ID     = process.env.THREAD_ID; // optional
-const API_URL       = 'https://believe.xultra.fun/api/transactions';
-const CREATOR_URL   = 'https://believe.xultra.fun/api/creator';
+const BOT_TOKEN   = process.env.TELEGRAM_TOKEN;
+const CHAT_ID     = process.env.CHAT_ID;
+const THREAD_ID   = process.env.THREAD_ID; // optional
+// NEW endpoint:
+const API_URL       = 'https://believe.xultra.fun/api/coins';
 const ETHOS_URL     = 'https://believe.xultra.fun/api/ethos';
-const POLL_INTERVAL = 3000;  // 3 seconds
+const POLL_INTERVAL = 3000;
 
 // ── STATE FILES ─────────────────────────────────────────────────────────────
 
 const PROCESSED_FILE = path.join(__dirname, 'processed.json');
-const TIMESTAMP_FILE = path.join(__dirname, 'last_block_time.txt');
 
-// load processed IDs
+// load processed token‐IDs
 let processed = new Set();
 if (fs.existsSync(PROCESSED_FILE)) {
   try {
     JSON.parse(fs.readFileSync(PROCESSED_FILE, 'utf8'))
-      .forEach(id => processed.add(id));
+        .forEach(id => processed.add(id));
   } catch {}
 }
 
-// ── UTILITIES ────────────────────────────────────────────────────────────────
+// ── HELPERS ─────────────────────────────────────────────────────────────────
 
-const http = axios.create();
-const IPFS_GATEWAYS = [
-  'https://cloudflare-ipfs.com',
-  'https://dweb.link',
-  'https://gateway.pinata.cloud',
-  'https://ipfs.io'
-];
+const http = axios.create({ timeout: 10_000 });
 const sleep = ms => new Promise(r => setTimeout(r, ms));
-
 function escapeHtml(str) {
-  return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  return String(str)
+    .replace(/&/g,'&amp;')
+    .replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;');
 }
 
-// ── TELEGRAM SENDING ────────────────────────────────────────────────────────
+// ── TELEGRAM SENDER ─────────────────────────────────────────────────────────
 
 async function sendMessage(html) {
   const body = { chat_id: CHAT_ID, text: html, parse_mode: 'HTML' };
@@ -58,9 +53,7 @@ async function sendMessage(html) {
   } catch (e) {
     const resp = e.response?.data;
     if (resp?.error_code === 429 && resp.parameters?.retry_after) {
-      const ms = (resp.parameters.retry_after + 1) * 1000;
-      console.warn(`Rate limited sendMessage, waiting ${ms/1000}s`);
-      await sleep(ms);
+      await sleep((resp.parameters.retry_after + 1) * 1000);
       return sendMessage(html);
     }
     console.error("sendMessage error:", resp || e.message);
@@ -69,6 +62,7 @@ async function sendMessage(html) {
 
 async function sendWithImage(photoUrl, caption) {
   if (!photoUrl) return sendMessage(caption);
+
   const body = {
     chat_id:    CHAT_ID,
     photo:      photoUrl,
@@ -82,9 +76,7 @@ async function sendWithImage(photoUrl, caption) {
   } catch (e) {
     const resp = e.response?.data;
     if (resp?.error_code === 429 && resp.parameters?.retry_after) {
-      const ms = (resp.parameters.retry_after + 1) * 1000;
-      console.warn(`Rate limited sendPhoto, waiting ${ms/1000}s`);
-      await sleep(ms);
+      await sleep((resp.parameters.retry_after + 1) * 1000);
       return sendWithImage(photoUrl, caption);
     }
     console.warn("sendPhoto failed, falling back to sendMessage:", resp || e.message);
@@ -92,68 +84,35 @@ async function sendWithImage(photoUrl, caption) {
   }
 }
 
-// ── DATA FETCHERS ────────────────────────────────────────────────────────────
+// ── DATA FETCHER ────────────────────────────────────────────────────────────
 
-async function fetchTxns() {
+async function fetchTokens() {
   try {
-    const r = await http.get(API_URL, { timeout: 10_000 });
-    if (!r.data || !Array.isArray(r.data.transactions)) {
-      console.warn("fetchTxns: invalid JSON, skipping this round");
+    const r = await http.get(API_URL);
+    if (!r.data || !Array.isArray(r.data.tokens)) {
+      console.warn("fetchTokens: invalid JSON:", r.data);
       return [];
     }
-    return r.data.transactions;
+    return r.data.tokens;
   } catch (e) {
-    const status = e.response?.status;
-    if (status >= 500) {
-      console.warn(`fetchTxns: server error ${status}, backing off 1s`);
-      await sleep(1000);
-    } else {
-      console.error("fetchTxns error:", e.message);
-    }
+    console.error("fetchTokens error:", e.response?.status, e.message);
+    // on server errors back off 1s:
+    if (e.response?.status >= 500) await sleep(1000);
     return [];
   }
 }
 
-async function fetchMetadata(uri) {
-  let ipfsPath;
-  try { ipfsPath = new URL(uri).pathname; }
-  catch { throw new Error(`Invalid metadata URI: ${uri}`); }
+// ── ETHOS FETCH ─────────────────────────────────────────────────────────────
 
-  let lastErr;
-  for (const gw of IPFS_GATEWAYS) {
-    try {
-      const r = await http.get(gw + ipfsPath, { timeout: 10_000 });
-      return r.data;
-    } catch (err) {
-      lastErr = err;
-    }
-  }
-  // final fallback
-  const r = await http.get(uri, { timeout: 10_000 });
-  return r.data;
-}
-
-async function fetchCreatorInfo(addr) {
-  try {
-    const r = await http.get(`${CREATOR_URL}?address=${addr}`, { timeout: 5_000 });
-    return {
-      username:       r.data.username       || '',
-      followers:      r.data.followersCount ?? 0,
-      smartFollowers: r.data.smartFollowersCount ?? 0
-    };
-  } catch {
-    return { username:'', followers:0, smartFollowers:0 };
-  }
-}
-
-async function fetchEthos(u) {
+async function fetchEthos(username) {
+  if (!username) return 0;
   try {
     const r = await http.post(
       ETHOS_URL,
-      { usernames:[u] },
-      { headers:{ 'Content-Type':'application/json' }, timeout:5_000 }
+      { usernames: [username] },
+      { headers: { 'Content-Type': 'application/json' } }
     );
-    return r.data.scores?.[u.toLowerCase()] ?? 0;
+    return r.data.scores?.[username.toLowerCase()] ?? 0;
   } catch {
     return 0;
   }
@@ -161,66 +120,67 @@ async function fetchEthos(u) {
 
 // ── STATE PERSISTENCE ───────────────────────────────────────────────────────
 
-function markProcessed(txn) {
-  processed.add(txn.id);
+function markProcessed(token) {
+  processed.add(token.id);
   fs.writeFileSync(PROCESSED_FILE, JSON.stringify([...processed]), 'utf8');
-  if (typeof txn.block_time === 'number') {
-    fs.writeFileSync(TIMESTAMP_FILE, String(txn.block_time), 'utf8');
-  }
 }
 
-// ── PROCESS & SEND ───────────────────────────────────────────────────────────
+// ── PROCESS & SEND ──────────────────────────────────────────────────────────
 
-async function processTxn(txn) {
-  if (processed.has(txn.id)) return;
-  if (!txn.tokenInfo) {
-    markProcessed(txn);
-    return;
-  }
+async function processToken(token) {
+  // skip if already posted
+  if (processed.has(token.id)) return;
 
-  const { symbol, address, uri } = {
-    symbol:  txn.tokenInfo.symbol  || '',
-    address: txn.tokenInfo.address || '',
-    uri:     txn.tokenInfo.uri
-  };
+  // destructure the new shape
+  const {
+    symbol,
+    name,
+    address,
+    imageUrl,
+    metadata
+  } = token;
 
-  let meta = {};
-  try { meta = await fetchMetadata(uri); }
-  catch (err) { console.warn("metadata failed:", err.message); }
+  // metadata.creator holds creator info now
+  const creatorInfo = metadata?.creator || {};
+  const username       = creatorInfo.twitterUsername || '';
+  const followers      = creatorInfo.followersCount    || 0;
+  const smartFollowers = creatorInfo.smartFollowersCount || 0;
 
-  const rawImage = meta.image || '';
-  const imageUrl = rawImage.startsWith('http') ? rawImage : '';
+  // fetch ethos
+  const ethosScore = await fetchEthos(username);
 
-  const { username: creator, followers, smartFollowers } =
-    await fetchCreatorInfo(address);
-
-  const ethosScore = creator ? await fetchEthos(creator) : 0;
-
+  // build caption
   const caption = [
     `<b>Ticker:</b> $${escapeHtml(symbol)}`,
-    `<b>Token Name:</b> ${escapeHtml(meta.name||'')}`,
-    `<b>Creator:</b> <a href="https://x.com/${escapeHtml(creator)}">${escapeHtml(creator)}</a>`,
+    `<b>Token Name:</b> ${escapeHtml(name)}`,
+    `<b>Creator:</b> <a href="https://x.com/${escapeHtml(username)}">${escapeHtml(username)}</a>`,
     `<b>Followers:</b> ${followers.toLocaleString()}`,
     `<b>Smart Followers:</b> ${smartFollowers.toLocaleString()}`,
     `<b>Ethos:</b> ${ethosScore.toLocaleString()}`,
     `<b>CA:</b> <code>${escapeHtml(address)}</code>`
   ].join('\n');
 
+  // send to Telegram
   await sendWithImage(imageUrl, caption);
-  markProcessed(txn);
+
+  // persist so we don’t re-send
+  markProcessed(token);
 }
 
+// ── POLLING LOOP ────────────────────────────────────────────────────────────
+
 async function poll() {
-  const txns = await fetchTxns();
-  for (const txn of txns.slice().reverse()) {
-    await processTxn(txn);
+  const tokens = await fetchTokens();
+  // oldest first
+  for (const tok of tokens.slice().reverse()) {
+    await processToken(tok);
   }
 }
 
-// ── STARTUP & POLLING ───────────────────────────────────────────────────────
+// ── BOOTSTRAP ───────────────────────────────────────────────────────────────
 
 ;(async () => {
-  console.info(`🔔 Bot started (processed ${processed.size} txns)`);
+  console.info(`🔔 Bot started (already posted ${processed.size} tokens)`);
   await poll();
   setInterval(poll, POLL_INTERVAL);
 })();
